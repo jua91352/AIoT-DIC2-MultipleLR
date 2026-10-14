@@ -2,8 +2,10 @@
  * mlr.js — 多元線性回歸（OLS）計算引擎，無外部相依套件
  * 瀏覽器：window.MLR；Node：require('./mlr.js')
  *
- * 資料切分（mulberry32 + Fisher–Yates）、型態判斷、One-hot、OLS 檢定、VIF 與逆向淘汰
- * 都和 .claude/skills/mlr-crisp-dm/scripts/mlr_pipeline.py 相同，兩邊結果可以互相對照。
+ * 資料切分與 scikit-learn train_test_split(random_state) 逐位元相同（numpy MT19937），
+ * One-hot 與 pandas get_dummies(drop_first=True) 相同；5 種特徵選擇方法（Pearson、SelectKBest、
+ * RFE、Forward SFS、Lasso）與 LassoCV 都依 scikit-learn 的定義實作，
+ * 和 .claude/skills/mlr-crisp-dm/scripts/mlr_pipeline.py 的結果可以互相對照。
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -85,23 +87,45 @@
 
   /* ============================ 亂數與資料切分 ============================ */
 
-  // mulberry32：可重現的 32-bit 亂數產生器（Python 版有逐位元相同的實作）
-  function mulberry32(seed) {
-    let a = seed >>> 0;
-    return function () {
-      a = (a + 0x6d2b79f5) >>> 0;
-      let t = Math.imul(a ^ (a >>> 15), a | 1);
-      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  // MT19937：與 numpy.random.RandomState(seed) 逐位元相同的 32-bit 亂數產生器
+  function mt19937(seed) {
+    const mt = new Uint32Array(624);
+    let pos = 624;
+    mt[0] = seed >>> 0;
+    for (let i = 1; i < 624; i++) {
+      const s = mt[i - 1] ^ (mt[i - 1] >>> 30);
+      mt[i] = (Math.imul(1812433253, s) + i) >>> 0;
+    }
+    function twist() {
+      for (let i = 0; i < 624; i++) {
+        const y = (mt[i] & 0x80000000) | (mt[(i + 1) % 624] & 0x7fffffff);
+        let v = mt[(i + 397) % 624] ^ (y >>> 1);
+        if (y & 1) v ^= 0x9908b0df;
+        mt[i] = v >>> 0;
+      }
+      pos = 0;
+    }
+    return function next() {
+      if (pos >= 624) twist();
+      let y = mt[pos++];
+      y ^= y >>> 11;
+      y ^= (y << 7) & 0x9d2c5680;
+      y ^= (y << 15) & 0xefc60000;
+      y ^= y >>> 18;
+      return y >>> 0;
     };
   }
 
-  function shuffledIndices(n, seed) {
-    const rand = mulberry32(seed);
+  // numpy RandomState(seed).permutation(n)：Fisher–Yates，j 以位元遮罩 + 拒絕取樣產生（legacy random_interval）
+  function permutation(n, seed) {
+    const next = mt19937(seed);
     const idx = [];
     for (let i = 0; i < n; i++) idx.push(i);
     for (let i = n - 1; i > 0; i--) {
-      const j = Math.floor(rand() * (i + 1));
+      let mask = i;
+      mask |= mask >>> 1; mask |= mask >>> 2; mask |= mask >>> 4; mask |= mask >>> 8; mask |= mask >>> 16;
+      let j;
+      while ((j = (next() & mask) >>> 0) > i);
       const t = idx[i];
       idx[i] = idx[j];
       idx[j] = t;
@@ -109,11 +133,30 @@
     return idx;
   }
 
-  // 洗牌後前 round(n × testRatio) 筆為測試集，其餘為訓練集
+  // 與 sklearn train_test_split(test_size, random_state=seed) 相同：排列的前 ceil(n × test_size) 筆為測試集，
+  // 接下來 floor(n × (1 − test_size)) 筆為訓練集（兩者都保留排列順序，交叉驗證的折也依這個順序切）
   function trainTestSplit(n, testRatio, seed) {
-    const idx = shuffledIndices(n, seed);
-    const nTest = Math.round(n * testRatio);
-    return { test: idx.slice(0, nTest), train: idx.slice(nTest) };
+    const perm = permutation(n, seed);
+    const nTest = Math.ceil(testRatio * n), nTrain = Math.floor((1 - testRatio) * n);
+    return { test: perm.slice(0, nTest), train: perm.slice(nTest, nTest + nTrain) };
+  }
+
+  // sklearn KFold(n_splits, shuffle=True, random_state=seed)：先以 RandomState(seed) 洗牌，
+  // 再依序切段（前 n % n_splits 段多 1 筆）；seed 為 null 時不洗牌
+  function kFold(n, nSplits, seed) {
+    const idx = seed == null ? Array.from({ length: n }, (_, i) => i) : permutation(n, seed);
+    const folds = [];
+    let start = 0;
+    for (let f = 0; f < nSplits; f++) {
+      const size = Math.floor(n / nSplits) + (f < n % nSplits ? 1 : 0);
+      const inTest = new Uint8Array(n);
+      for (let i = start; i < start + size; i++) inTest[idx[i]] = 1;
+      const test = idx.slice(start, start + size), train = [];
+      for (let i = 0; i < n; i++) if (!inTest[i]) train.push(i);
+      folds.push({ train, test });
+      start += size;
+    }
+    return folds;
   }
 
   /* =============================== CSV 解析 =============================== */
@@ -228,11 +271,12 @@
     const byName = new Map(columns.map(c => [c.name, c]));
     const tc = byName.get(target);
     if (!tc) throw new Error(`找不到目標欄位「${target}」。`);
+    // 與 pandas get_dummies 相同的欄位順序：數值欄在前，類別欄展開的 dummy 接在後面
     const fcs = features.map(f => {
       const c = byName.get(f);
       if (!c) throw new Error(`找不到特徵欄位「${f}」。`);
       return c;
-    });
+    }).sort((a, b) => (a.type === 'numeric' ? 0 : 1) - (b.type === 'numeric' ? 0 : 1) || a.index - b.index);
 
     // 刪除目標或任一特徵缺失（或數值欄無法轉成數字）的資料列
     const used = [], rowIndex = [];
@@ -572,280 +616,333 @@
     return model.featureIndex.map((j, k) => (model.beta[k + 1] * std(X.map(r => r[j]))) / sdY);
   }
 
-  // 逆向淘汰：每次移除 p 值最大且 > SL 的特徵，直到全部顯著
-  function backwardElimination(X, y, names, sl, cols) {
-    let active = cols ? cols.slice() : names.map((_, j) => j);
-    const steps = [];
+  /* ===================== 特徵選擇：5 種方法 × 特徵數 k ===================== */
+
+  const take = (idx, arr) => idx.map(i => arr[i]);
+
+  // StandardScaler：只用訓練集配適，母體標準差（ddof = 0），常數欄的尺度設為 1
+  function standardScaler(X) {
+    const n = X.length, K = X[0].length;
+    const center = [], scale = [];
+    for (let j = 0; j < K; j++) {
+      let m = 0;
+      for (const r of X) m += r[j];
+      m /= n;
+      let v = 0;
+      for (const r of X) v += (r[j] - m) * (r[j] - m);
+      center.push(m);
+      scale.push(v > 0 ? Math.sqrt(v / n) : 1);
+    }
+    return { center, scale, transform: A => A.map(r => r.map((v, j) => (v - center[j]) / scale[j])) };
+  }
+
+  // 只求係數的最小平方法（含截距），給交叉驗證、RFE 這類大量重複配適使用；共線欄位自動略過
+  function lsFit(X, y, cols) {
+    let keep = cols.slice();
     for (;;) {
-      const model = fitOLS(X, y, names, active);
-      let worst = -1;
-      for (let k = 1; k < model.coefficients.length; k++) {
-        if (worst === -1 || model.coefficients[k].p > model.coefficients[worst].p) worst = k;
-      }
-      if (worst === -1 || !(model.coefficients[worst].p > sl)) return { model, steps };
-      steps.push({
-        removed: model.coefficients[worst].name,
-        p: model.coefficients[worst].p,
-        r2: model.r2,
-        adjR2: model.adjR2,
-        nFeatures: active.length,
+      if (X.length <= keep.length) return null;
+      const design = X.map(r => {
+        const row = [1];
+        for (const j of keep) row.push(r[j]);
+        return row;
       });
-      active = model.featureIndex.filter((_, k) => k !== worst - 1);
-    }
-  }
-
-  /* ===================== 特徵選擇：依特徵數 k 比較各方法 ===================== */
-
-  // 標準化 Gram 矩陣：A = ZᵀZ、c = Zᵀ(y − ȳ)，Z 為標準化特徵。截距由中心化處理，
-  // 任一子集的 RSS 只需解 k×k 系統，最佳子集法才能快速窮舉。
-  function standardizedGram(X, y, cols) {
-    const n = y.length, K = cols.length;
-    const mu = cols.map(j => mean(X.map(r => r[j])));
-    const sd = cols.map(j => std(X.map(r => r[j])));
-    const ym = mean(y);
-    const A = Array.from({ length: K }, () => new Array(K).fill(0));
-    const c = new Array(K).fill(0);
-    let syy = 0;
-    for (let i = 0; i < n; i++) {
-      const z = cols.map((j, a) => (X[i][j] - mu[a]) / sd[a]);
-      const yc = y[i] - ym;
-      for (let a = 0; a < K; a++) {
-        c[a] += z[a] * yc;
-        for (let b = a; b < K; b++) A[a][b] += z[a] * z[b];
+      const qr = householderQR(design, y);
+      let bad = -1;
+      for (let k = 0; k <= keep.length; k++) {
+        if (!(Math.abs(qr.R[k][k]) > 1e-10 * qr.colNorm[k])) { bad = k; break; }
       }
-      syy += yc * yc;
+      if (bad === -1) return { cols: keep, beta: solveUpper(qr.R, qr.qty) };
+      if (bad === 0) return null;
+      keep = keep.filter((_, k) => k !== bad - 1);
     }
-    for (let a = 0; a < K; a++) for (let b = 0; b < a; b++) A[a][b] = A[b][a];
-    return { A, c, syy, n, K };
   }
 
-  // Cholesky 解 A_S b = c_S，回傳 RSS 與標準化尺度的係數
-  function subsetSolve(g, S) {
-    const k = S.length;
-    if (!k) return { rss: g.syy, b: [] };
-    const L = Array.from({ length: k }, () => new Array(k).fill(0));
-    for (let i = 0; i < k; i++) {
-      for (let j = 0; j <= i; j++) {
-        let s = g.A[S[i]][S[j]];
-        for (let t = 0; t < j; t++) s -= L[i][t] * L[j][t];
-        if (i === j) {
-          if (!(s > 1e-10 * g.A[S[i]][S[i]])) return { rss: Infinity, b: null };
-          L[i][i] = Math.sqrt(s);
-        } else L[i][j] = s / L[j][j];
+  function lsPredict(fit, X) {
+    return X.map(r => {
+      let s = fit.beta[0];
+      fit.cols.forEach((j, k) => { s += fit.beta[k + 1] * r[j]; });
+      return s;
+    });
+  }
+
+  // k 折交叉驗證（sklearn cross_val_score 的定義：每折算一次分數再平均）
+  function cvScore(folds, cols) {
+    let r2 = 0, rmse = 0;
+    for (const f of folds) {
+      const fit = lsFit(f.Xtr, f.ytr, cols);
+      if (!fit) return { r2: NaN, rmse: NaN };
+      const m = metrics(f.yte, lsPredict(fit, f.Xte), cols.length);
+      r2 += m.r2;
+      rmse += m.rmse;
+    }
+    return { r2: r2 / folds.length, rmse: rmse / folds.length };
+  }
+
+  function makeFolds(X, y, nSplits, seed) {
+    return kFold(y.length, nSplits, seed).map(f => ({
+      Xtr: take(f.train, X), ytr: take(f.train, y), Xte: take(f.test, X), yte: take(f.test, y),
+    }));
+  }
+
+  // 1. Pearson（Filter）：訓練集 |r(x_j, y)| 由大到小
+  function pearsonRanking(r) {
+    const idx = r.map((_, j) => j);
+    const score = j => (Number.isFinite(r[j]) ? Math.abs(r[j]) : 0);
+    return idx.sort((a, b) => score(b) - score(a) || a - b);
+  }
+
+  // 2. SelectKBest(f_regression)（Filter）：F_j = r² / (1 − r²) × (n − 2)，取 F 最大的 k 個。
+  //    同分時與 sklearn 相同（mergesort 由小到大排序後取最後 k 個 → 索引大的優先）
+  function kbestRanking(F) {
+    const idx = F.map((_, j) => j);
+    const score = j => (Number.isFinite(F[j]) ? F[j] : 0);
+    return idx.sort((a, b) => score(b) - score(a) || b - a);
+  }
+
+  // 3. RFE（Wrapper）：標準化特徵上配適 OLS，每輪移除 |係數| 最小的特徵，直到剩 1 個
+  function rfeRanking(Z, y) {
+    let S = Z[0].map((_, j) => j);
+    const removed = [];
+    while (S.length > 1) {
+      const fit = lsFit(Z, y, S);
+      let worst = 0;
+      if (fit && fit.cols.length === S.length) {
+        for (let i = 1; i < S.length; i++) if (Math.abs(fit.beta[i + 1]) < Math.abs(fit.beta[worst + 1])) worst = i;
       }
+      removed.push(S[worst]);
+      S = S.filter((_, i) => i !== worst);
     }
-    const z = new Array(k);
-    for (let i = 0; i < k; i++) {
-      let s = g.c[S[i]];
-      for (let t = 0; t < i; t++) s -= L[i][t] * z[t];
-      z[i] = s / L[i][i];
-    }
-    const b = new Array(k);
-    for (let i = k - 1; i >= 0; i--) {
-      let s = z[i];
-      for (let t = i + 1; t < k; t++) s -= L[t][i] * b[t];
-      b[i] = s / L[i][i];
-    }
-    let zz = 0;
-    for (const v of z) zz += v * v;
-    return { rss: g.syy - zz, b };
+    return [...S, ...removed.reverse()];
   }
 
-  // 以下各方法回傳 subsets[k] = 第 k 步選到的特徵位置（0..K−1）
-
-  // 前向選擇（Forward SFS）：每步加入讓訓練 RSS 下降最多的特徵
-  function forwardPath(g) {
-    const chosen = [], subsets = [];
-    const left = [];
-    for (let a = 0; a < g.K; a++) left.push(a);
+  // 4. Forward SFS（Wrapper）：sklearn SequentialFeatureSelector(LinearRegression(), direction="forward",
+  //    cv=KFold(5, shuffle=True, random_state))，每一步加入讓 5 折交叉驗證平均 R² 最高的特徵
+  function forwardRanking(folds, K) {
+    const chosen = [], left = [];
+    for (let j = 0; j < K; j++) left.push(j);
     while (left.length) {
-      let best = -1, bestRss = Infinity;
-      for (const a of left) {
-        const { rss } = subsetSolve(g, [...chosen, a]);
-        if (best === -1 || rss < bestRss) { best = a; bestRss = rss; }
+      let best = -1, bestScore = -Infinity;
+      for (const j of left) {
+        const s = cvScore(folds, [...chosen, j]).r2;
+        if (best === -1 || s > bestScore) { best = j; bestScore = s; }
       }
       chosen.push(best);
       left.splice(left.indexOf(best), 1);
-      subsets[chosen.length] = chosen.slice();
     }
-    return subsets;
+    return chosen;
   }
 
-  // RFE：從全部特徵開始，每步移除 |標準化係數| 最小的特徵
-  function rfePath(g) {
-    let S = [];
-    for (let a = 0; a < g.K; a++) S.push(a);
-    const subsets = [];
-    subsets[S.length] = S.slice();
-    while (S.length > 1) {
-      const { b } = subsetSolve(g, S);
-      let worst = 0;
-      for (let i = 1; i < S.length; i++) if (Math.abs(b[i]) < Math.abs(b[worst])) worst = i;
-      S = S.filter((_, i) => i !== worst);
-      subsets[S.length] = S.slice();
-    }
-    return subsets;
-  }
-
-  // 逆向淘汰（p 值）一路做到只剩 1 個特徵
-  function pValuePath(X, y, names, cols) {
-    let active = cols.slice();
-    const subsets = [];
-    subsets[active.length] = active.map(j => cols.indexOf(j));
-    while (active.length > 1) {
-      const m = fitOLS(X, y, names, active);
-      let worst = 1;
-      for (let k = 2; k < m.coefficients.length; k++) if (m.coefficients[k].p > m.coefficients[worst].p) worst = k;
-      active = m.featureIndex.filter((_, k) => k !== worst - 1);
-      subsets[active.length] = active.map(j => cols.indexOf(j));
-    }
-    return subsets;
-  }
-
-  // 最佳子集（Exhaustive）：每個 k 找訓練 RSS 最小的組合（特徵數 ≤ 15 才窮舉）
-  function bestSubsetPath(g, maxK = 15) {
-    const K = g.K;
-    if (K > maxK) return null;
-    const best = [];
-    for (let mask = 1; mask < (1 << K); mask++) {
-      const S = [];
-      for (let a = 0; a < K; a++) if (mask & (1 << a)) S.push(a);
-      const { rss } = subsetSolve(g, S);
-      if (!best[S.length] || rss < best[S.length].rss) best[S.length] = { rss, S };
-    }
-    return best.map(v => v && v.S);
-  }
-
-  // Lasso / ElasticNet：沿 λ 由大到小的路徑（座標下降），依特徵「第一次進入模型」的順序排序
-  function enetPath(g, l1Ratio, nLambda = 100, eps = 1e-4) {
-    const K = g.K, n = g.n;
-    const sdY = Math.sqrt(g.syy / (n - 1));
-    const c = g.c.map(v => v / sdY);
-    let lamMax = 0;
-    for (const v of c) lamMax = Math.max(lamMax, Math.abs(v) / (n * l1Ratio));
-    const coef = new Array(K).fill(0);
-    const enter = new Array(K).fill(Infinity);
-    for (let s = 0; s < nLambda; s++) {
-      const lam = lamMax * Math.pow(eps, s / (nLambda - 1));
-      for (let it = 0; it < 2000; it++) {
-        let maxDelta = 0;
-        for (let j = 0; j < K; j++) {
-          let r = c[j];
-          for (let l = 0; l < K; l++) if (l !== j) r -= g.A[j][l] * coef[l];
-          const z = r / n;
-          const nb = (Math.sign(z) * Math.max(Math.abs(z) - lam * l1Ratio, 0)) / (g.A[j][j] / n + lam * (1 - l1Ratio));
-          maxDelta = Math.max(maxDelta, Math.abs(nb - coef[j]));
-          coef[j] = nb;
-        }
-        if (maxDelta < 1e-10) break;
+  // 中心化後的 Gram 矩陣：G = XcᵀXc、c = Xcᵀyc（Lasso 座標下降只需要這兩個）
+  function centeredGram(X, y) {
+    const n = y.length, K = X[0].length;
+    const mx = new Array(K).fill(0);
+    for (const r of X) for (let j = 0; j < K; j++) mx[j] += r[j] / n;
+    const my = mean(y);
+    const G = Array.from({ length: K }, () => new Array(K).fill(0));
+    const c = new Array(K).fill(0);
+    for (let i = 0; i < n; i++) {
+      const xc = X[i].map((v, j) => v - mx[j]);
+      const yc = y[i] - my;
+      for (let a = 0; a < K; a++) {
+        c[a] += xc[a] * yc;
+        for (let b = a; b < K; b++) G[a][b] += xc[a] * xc[b];
       }
-      for (let j = 0; j < K; j++) if (enter[j] === Infinity && Math.abs(coef[j]) > 1e-12) enter[j] = s;
     }
-    const order = [];
-    for (let a = 0; a < K; a++) order.push(a);
-    order.sort((a, b) => (enter[a] - enter[b]) || (Math.abs(coef[b]) - Math.abs(coef[a])) || (a - b));
-    const subsets = [];
-    for (let k = 1; k <= K; k++) subsets[k] = order.slice(0, k);
-    return subsets;
+    for (let a = 0; a < K; a++) for (let b = 0; b < a; b++) G[a][b] = G[b][a];
+    return { G, c, n, K, mx, my };
+  }
+
+  // Lasso 座標下降：min (1/2n)‖yc − Xc b‖² + α‖b‖₁（與 sklearn Lasso 的目標函數相同），b 為暖啟動初值
+  function lassoCD(g, alpha, b) {
+    const t = g.n * alpha;
+    for (let it = 0; it < 100000; it++) {
+      let maxDelta = 0, maxB = 0;
+      for (let j = 0; j < g.K; j++) {
+        const d = g.G[j][j];
+        if (!(d > 0)) continue;
+        let r = g.c[j];
+        for (let l = 0; l < g.K; l++) if (l !== j) r -= g.G[j][l] * b[l];
+        const nb = r > t ? (r - t) / d : r < -t ? (r + t) / d : 0;
+        maxDelta = Math.max(maxDelta, Math.abs(nb - b[j]));
+        maxB = Math.max(maxB, Math.abs(nb));
+        b[j] = nb;
+      }
+      if (maxDelta === 0 || maxDelta <= 1e-13 * maxB) break;
+    }
+    return b;
+  }
+
+  const alphaMax = g => Math.max(...g.c.map(Math.abs)) / g.n;
+
+  // np.geomspace(αmax, αmax × eps, num)
+  function alphaGrid(amax, eps, num) {
+    const out = [];
+    for (let i = 0; i < num; i++) out.push(amax * Math.pow(eps, i / (num - 1)));
+    return out;
+  }
+
+  // 5. Lasso（Embedded）：依 LassoCV 收縮後的 |係數| 由大到小排序；係數同為 0 的特徵依
+  //    np.argsort(|coef|)[::-1] 的慣例排序（索引大的在前，與 SelectKBest 的同分規則相同）
+  function lassoRanking(coef) {
+    return coef.map((_, j) => j).sort((a, b) => Math.abs(coef[b]) - Math.abs(coef[a]) || b - a);
+  }
+
+  // LassoCV(cv=KFold(5, shuffle=True, random_state))：在標準化訓練集上以 5 折 CV 從 100 個 α 中選
+  //    平均 MSE 最小者，再用整個訓練集重新配適。回傳 Lasso 原生收縮後的係數（不再用 OLS 重配），即圖中的 ★
+  function lassoCV(Z, y, foldsZ, nAlphas = 100, eps = 1e-3) {
+    const gAll = centeredGram(Z, y);
+    const amax = alphaMax(gAll);
+    if (!(amax > 0)) return null;
+    const alphas = alphaGrid(amax, eps, nAlphas);
+    const mse = new Array(nAlphas).fill(0);
+    for (const f of foldsZ) {
+      const g = centeredGram(f.Xtr, f.ytr);
+      const b = new Array(g.K).fill(0);
+      alphas.forEach((alpha, a) => {
+        lassoCD(g, alpha, b);
+        const b0 = g.my - g.mx.reduce((s, m, j) => s + m * b[j], 0);
+        let e2 = 0;
+        f.Xte.forEach((r, i) => {
+          const p = r.reduce((s, v, j) => s + v * b[j], b0);
+          e2 += (f.yte[i] - p) * (f.yte[i] - p);
+        });
+        mse[a] += e2 / f.yte.length / foldsZ.length;
+      });
+    }
+    let best = 0;
+    for (let a = 1; a < nAlphas; a++) if (mse[a] < mse[best]) best = a;
+    const b = new Array(gAll.K).fill(0);
+    for (let a = 0; a <= best; a++) lassoCD(gAll, alphas[a], b);
+    const intercept = gAll.my - gAll.mx.reduce((s, m, j) => s + m * b[j], 0);
+    return { alphas, mse, alpha: alphas[best], index: best, coef: b, intercept };
   }
 
   const SELECTION_METHODS = [
-    { key: 'backward_p', label: '逆向淘汰（p 值）', short: '逆向 p 值' },
-    { key: 'forward', label: '前向選擇 Forward', short: 'Forward' },
-    { key: 'rfe', label: 'RFE（|標準化係數|）', short: 'RFE' },
-    { key: 'best', label: '最佳子集 Exhaustive', short: '最佳子集' },
-    { key: 'lasso', label: 'Lasso（L1 排序）', short: 'Lasso' },
-    { key: 'enet', label: 'ElasticNet（α = 0.5）', short: 'ElasticNet' },
+    { key: 'pearson', label: 'Pearson', family: 'Filter', short: 'Pearson' },
+    { key: 'kbest', label: 'SelectKBest F-test', family: 'Filter', short: 'SelectKBest' },
+    { key: 'rfe', label: 'RFE', family: 'Wrapper', short: 'RFE' },
+    { key: 'sfs', label: 'Forward SFS', family: 'Wrapper', short: 'Forward SFS' },
+    { key: 'lasso', label: 'Lasso', family: 'Embedded', short: 'Lasso' },
   ];
 
-  // 對每個方法、每個 k：在訓練集以 OLS 配適該子集，再用測試集評估
-  function featureSelection(Xtr, ytr, Xte, yte, names, cols) {
-    const g = standardizedGram(Xtr, ytr, cols);
-    const subsetsByKey = {
-      backward_p: pValuePath(Xtr, ytr, names, cols),
-      forward: forwardPath(g),
-      rfe: rfePath(g),
-      best: bestSubsetPath(g),
-      lasso: enetPath(g, 1),
-      enet: enetPath(g, 0.5),
+  // cols：候選特徵（design 欄位索引）；seed：交叉驗證 KFold 的 random_state。
+  // 每個方法對每個 k 選出特徵後，都在訓練集用 OLS 重新配適，再評估測試集、訓練集與 5 折 CV（訓練集內）
+  function featureSelection(Xtr, ytr, Xte, yte, names, cols, seed, nFolds = 5) {
+    const K = cols.length;
+    const Xc = Xtr.map(r => cols.map(j => r[j]));
+    const Xc_te = Xte.map(r => cols.map(j => r[j]));
+    const scaler = standardScaler(Xc);
+    const Z = scaler.transform(Xc), Zte = scaler.transform(Xc_te);
+    const folds = makeFolds(Xc, ytr, nFolds, seed);
+    const foldsZ = makeFolds(Z, ytr, nFolds, seed);
+
+    const r = cols.map((_, a) => pearson(Xc.map(row => row[a]), ytr));
+    const n = ytr.length;
+    const F = r.map(v => (v * v) / (1 - v * v) * (n - 2));
+    const Fp = F.map(f => fSurvival(f, 1, n - 2));
+    let lcv = lassoCV(Z, ytr, foldsZ);
+    const rankings = {
+      pearson: pearsonRanking(r),
+      kbest: kbestRanking(F),
+      rfe: rfeRanking(Z, ytr),
+      sfs: forwardRanking(folds, K),
+      lasso: lcv ? lassoRanking(lcv.coef) : pearsonRanking(r),
     };
+
     const cache = new Map();
-    const evaluate = S => {
-      const sub = S.map(a => cols[a]).sort((a, b) => a - b);
-      const key = sub.join(',');
+    const evaluate = local => {
+      const sorted = local.slice().sort((a, b) => a - b);
+      const key = sorted.join(',');
       if (!cache.has(key)) {
-        const m = fitOLS(Xtr, ytr, names, sub);
+        const global = sorted.map(a => cols[a]);
+        const model = fitOLS(Xtr, ytr, names, global);
         cache.set(key, {
-          cols: sub, features: m.features, k: sub.length,
-          train: metrics(ytr, predict(m, Xtr), m.p - 1),
-          test: yte.length > 1 ? metrics(yte, predict(m, Xte), m.p - 1) : null,
+          key, local: sorted, cols: global, k: sorted.length, model,
+          features: model.features,
+          train: metrics(ytr, predict(model, Xtr), sorted.length),
+          test: yte.length > 1 ? metrics(yte, predict(model, Xte), sorted.length) : null,
+          cv: cvScore(folds, sorted),
         });
       }
       return cache.get(key);
     };
-    const methods = SELECTION_METHODS.filter(m => subsetsByKey[m.key]).map(m => {
-      const results = [];
-      for (let k = 1; k <= cols.length; k++) results[k] = evaluate(subsetsByKey[m.key][k]);
-      return { ...m, results };
+
+    const methods = SELECTION_METHODS.map(m => {
+      const order = rankings[m.key];
+      const results = [null];
+      for (let k = 1; k <= K; k++) {
+        results[k] = { ...evaluate(order.slice(0, k)), added: names[cols[order[k - 1]]], order: order.slice(0, k).map(a => names[cols[a]]) };
+      }
+      return { ...m, ranking: order.map(a => names[cols[a]]), results };
     });
-    // 最佳組合：測試集 RMSE 最小（同分取較少特徵）；沒有測試集時改用訓練集 Adj R²
+
+    // LassoCV 原生收縮模型（係數換回原始單位）
+    if (lcv) {
+      const coefRaw = lcv.coef.map((b, a) => b / scaler.scale[a]);
+      const intercept = lcv.intercept - coefRaw.reduce((s, b, a) => s + b * scaler.center[a], 0);
+      const pred = A => A.map(row => row.reduce((s, v, a) => s + v * coefRaw[a], intercept));
+      const active = cols.filter((_, a) => lcv.coef[a] !== 0);
+      lcv = {
+        ...lcv, coefRaw, interceptRaw: intercept, k: active.length,
+        features: active.map(j => names[j]),
+        train: metrics(ytr, pred(Xc), active.length),
+        test: yte.length > 1 ? metrics(yte, pred(Xc_te), active.length) : null,
+      };
+    }
+
+    return {
+      K, cols, names: cols.map(j => names[j]), methods, lassoCV: lcv, nFolds,
+      scaler, corr: r, F, Fp, seed,
+    };
+  }
+
+  // 依指定的評估基準（test / train / cv）找 RMSE 最低的組合；同分取特徵較少者，再依方法順序
+  function bestBy(selection, basis) {
     let best = null;
-    for (const m of methods) {
-      for (let k = 1; k <= cols.length; k++) {
+    for (const m of selection.methods) {
+      for (let k = 1; k <= selection.K; k++) {
         const res = m.results[k];
-        const score = res.test ? res.test.rmse : -res.train.adjR2;
-        if (!best || score < best.score || (score === best.score && k < best.k)) best = { score, k, method: m.key, label: m.label, ...res };
+        const s = res[basis];
+        if (!s || !Number.isFinite(s.rmse)) continue;
+        const better = !best || s.rmse < best.score * (1 - 1e-12) ||
+          (Math.abs(s.rmse - best.score) <= 1e-12 * best.score && k < best.k);
+        if (better) best = { score: s.rmse, k, method: m.key, res };
       }
     }
-    best.sameMethods = methods.filter(m => m.results[best.k].cols.join() === best.cols.join()).map(m => m.label);
-    return { K: cols.length, methods, best };
+    if (best) {
+      best.sameMethods = selection.methods.filter(m => m.results[best.k].key === best.res.key).map(m => m.key);
+    }
+    return best;
   }
 
   /* ========================= 完整流程（Modeling + Evaluation） ========================= */
 
-  // cfg：{ target, features, testRatio, seed, sl }
+  // cfg：{ target, features, testRatio, seed }
   function runAnalysis(table, columns, cfg) {
     const design = buildDesign(table, columns, cfg.target, cfg.features);
     const { X, y, names } = design;
     if (!names.length) throw new Error('請至少選擇一個特徵（feature）。');
-    if (y.length < 5) throw new Error(`可用的資料只有 ${y.length} 筆，太少了。`);
+    if (y.length < 15) throw new Error(`可用的資料只有 ${y.length} 筆，太少了（至少 15 筆）。`);
 
     const split = trainTestSplit(y.length, cfg.testRatio, cfg.seed);
-    const take = (idx, arr) => idx.map(i => arr[i]);
     const Xtr = take(split.train, X), ytr = take(split.train, y);
     const Xte = take(split.test, X), yte = take(split.test, y);
 
     const full = fitOLS(Xtr, ytr, names);
-    const be = backwardElimination(Xtr, ytr, names, cfg.sl, full.featureIndex);
-    const reduced = be.model;
-    const selection = featureSelection(Xtr, ytr, Xte, yte, names, full.featureIndex);
-    const sweet = fitOLS(Xtr, ytr, names, selection.best.cols);
-    const evaluate = m => ({
-      train: metrics(ytr, predict(m, Xtr), m.p - 1),
-      test: yte.length > 1 ? metrics(yte, predict(m, Xte), m.p - 1) : null,
-    });
-
+    const selection = featureSelection(Xtr, ytr, Xte, yte, names, full.featureIndex, cfg.seed);
     return {
-      cfg, design, split, Xtr, ytr, Xte, yte,
-      full, reduced, sweet,
-      steps: be.steps,
-      selection,
+      cfg, design, split, Xtr, ytr, Xte, yte, full, selection,
       vif: vif(Xtr, names, full.featureIndex),
-      stdCoef: {
-        full: standardizedCoefficients(full, Xtr, ytr),
-        reduced: standardizedCoefficients(reduced, Xtr, ytr),
-        sweet: standardizedCoefficients(sweet, Xtr, ytr),
-      },
-      evaluation: { full: evaluate(full), reduced: evaluate(reduced), sweet: evaluate(sweet) },
+      best: { test: bestBy(selection, 'test'), train: bestBy(selection, 'train'), cv: bestBy(selection, 'cv') },
     };
   }
 
   return {
     isMissing, toNumber, mean, std, describe, pearson,
-    mulberry32, shuffledIndices, trainTestSplit,
+    mt19937, permutation, trainTestSplit, kFold,
     parseCSV, inferColumns, buildDesign, encodeRow,
-    fitOLS, predict, predictInterval, metrics, vif, standardizedCoefficients, backwardElimination,
-    featureSelection, SELECTION_METHODS,
+    fitOLS, predict, predictInterval, metrics, vif, standardizedCoefficients,
+    featureSelection, bestBy, SELECTION_METHODS,
     tTwoSidedP, tInv, fSurvival,
     runAnalysis,
   };

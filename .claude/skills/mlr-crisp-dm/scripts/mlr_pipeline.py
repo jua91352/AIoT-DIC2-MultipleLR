@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CRISP-DM 多元線性回歸流程（Multiple Linear Regression pipeline）
+"""CRISP-DM 多元線性回歸 × 5 種特徵選擇方法（Multiple Linear Regression pipeline）
 
 用法：
     python mlr_pipeline.py --url <CSV 網址或路徑> --target <目標欄位> \
@@ -7,11 +7,18 @@
 
 輸出（reports/<slug>/）：
     report.md      CRISP-DM 六步驟分析報告
-    results.json   係數、檢定、指標等數值結果
-    figures/*.png  相關係數熱圖、實際 vs 預測、殘差圖、標準化係數
+    results.json   5 種方法在每個 k 的特徵與指標、LassoCV、全特徵 OLS 檢定
+    figures/*.png  5 種方法的 RMSE / R² 雙軌跡折線圖、相關係數熱圖、實際 vs 預測、殘差圖
 
-型態判斷、One-hot、資料切分（mulberry32 + Fisher–Yates）與統計方法
-都和網頁版 assets/js/mlr.js 相同，所以兩邊的數字可以互相對照。
+5 種方法（每個方法對 k = 1 ~ K 各選出 k 個特徵，再用 OLS 在訓練集重新配適、於測試集評估）：
+    1. Pearson（Filter）         訓練集 |r(x, y)| 由大到小
+    2. SelectKBest（Filter）     f_regression 的 F 值由大到小（F 是 |r| 的單調函數，排序與 Pearson 相同）
+    3. RFE（Wrapper）            RFE(LinearRegression) 於標準化特徵，每輪移除 |係數| 最小者
+    4. Forward SFS（Wrapper）    SequentialFeatureSelector(forward, cv=KFold(5, shuffle=True))
+    5. Lasso（Embedded）         LassoCV(cv=KFold(5, shuffle=True)) 收縮後的 |係數| 由大到小
+
+切分使用 scikit-learn train_test_split(test_size, random_state)，與網頁版 assets/js/mlr.js 逐筆相同，
+兩邊的每一個數字都可以互相對照。
 """
 from __future__ import annotations
 
@@ -29,14 +36,31 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from scipy import stats  # noqa: E402
-from scipy.linalg import solve_triangular  # noqa: E402
-from sklearn.linear_model import LinearRegression  # noqa: E402
+from sklearn.feature_selection import RFE, SequentialFeatureSelector, f_regression  # noqa: E402
+from sklearn.linear_model import LassoCV, LinearRegression  # noqa: E402
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score  # noqa: E402
+from sklearn.model_selection import KFold, cross_val_score, train_test_split  # noqa: E402
+from sklearn.preprocessing import StandardScaler  # noqa: E402
 
-M32 = 0xFFFFFFFF
 MISSING = {"", "na", "n/a", "nan", "null", "none", "?", "-"}
 NUM_RE = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?")
 ID_NAME_RE = re.compile(r"(id|index|unnamed: ?\d+)", re.IGNORECASE)
+
+METHODS = [
+    ("pearson", "Pearson", "Filter", "訓練集 |Pearson r(x, y)| 由大到小，取前 k 個"),
+    ("kbest", "SelectKBest F-test", "Filter", "`SelectKBest(f_regression)`：F = (n−2)·r²/(1−r²) 最大的 k 個（與 Pearson 排序相同）"),
+    ("rfe", "RFE", "Wrapper", "`RFE(LinearRegression)` 於標準化特徵，每輪移除 |係數| 最小的特徵"),
+    ("sfs", "Forward SFS", "Wrapper", "`SequentialFeatureSelector(forward, cv=KFold(5, shuffle=True))`，每步加入 CV 平均 R² 最高者"),
+    ("lasso", "Lasso", "Embedded", "`LassoCV(cv=KFold(5, shuffle=True))` 收縮後的 |係數| 由大到小（係數為 0 者排最後）"),
+]
+STYLE = {  # 與網頁相同的顏色 / 線型 / 標記
+    "pearson": dict(color="#2a78d6", ls="-", marker="o", fill="full"),
+    "kbest": dict(color="#eb6834", ls="--", marker="s", fill="none"),
+    "rfe": dict(color="#1baf7a", ls="-.", marker="^", fill="full"),
+    "sfs": dict(color="#e34948", ls=":", marker="D", fill="none"),
+    "lasso": dict(color="#4a3aa7", ls="-", marker="p", fill="none"),
+}
+JITTER = 0.06
 
 
 # ----------------------------------------------------------------- 基本工具
@@ -48,30 +72,6 @@ def is_missing(v) -> bool:
 def to_num(v) -> float:
     s = "" if v is None else str(v).strip()
     return float(s) if NUM_RE.fullmatch(s) else math.nan
-
-
-def mulberry32(seed: int):
-    """與 JavaScript 版逐位元相同的 32-bit 亂數產生器。"""
-    a = seed & M32
-
-    def rand() -> float:
-        nonlocal a
-        a = (a + 0x6D2B79F5) & M32
-        t = ((a ^ (a >> 15)) * (a | 1)) & M32
-        t ^= (t + (((t ^ (t >> 7)) * (t | 61)) & M32)) & M32
-        return ((t ^ (t >> 14)) & M32) / 4294967296
-
-    return rand
-
-
-def train_test_split_idx(n: int, test_ratio: float, seed: int):
-    rand = mulberry32(seed)
-    idx = list(range(n))
-    for i in range(n - 1, 0, -1):
-        j = math.floor(rand() * (i + 1))
-        idx[i], idx[j] = idx[j], idx[i]
-    n_test = math.floor(n * test_ratio + 0.5)  # 同 JavaScript Math.round
-    return idx[n_test:], idx[:n_test]
 
 
 # ------------------------------------------------------------ 資料理解與準備
@@ -115,6 +115,7 @@ def infer_columns(df: pd.DataFrame) -> list[dict]:
 
 
 def build_design(df: pd.DataFrame, cols: list[dict], target: str, features: list[str]):
+    """與 pandas get_dummies(drop_first=True) 相同：數值欄在前，類別欄的 dummy 接在後面。"""
     info = {c["name"]: c for c in cols}
     ok = df[target].map(lambda v: math.isfinite(to_num(v)))
     for f in features:
@@ -125,7 +126,8 @@ def build_design(df: pd.DataFrame, cols: list[dict], target: str, features: list
     used = df[ok].reset_index(drop=True)
 
     names, blocks, encodings = [], [], []
-    for f in features:
+    ordered = sorted(features, key=lambda f: (info[f]["type"] != "numeric", info[f]["index"]))
+    for f in ordered:
         if info[f]["type"] == "numeric":
             blocks.append(used[f].map(to_num).to_numpy(dtype=float))
             names.append(f)
@@ -164,29 +166,24 @@ def fit_ols(X: np.ndarray, y: np.ndarray, names: list[str], cols: list[int] | No
 
     p = A.shape[1]
     beta = np.linalg.solve(R, Q.T @ y)
-    fitted = A @ beta
-    resid = y - fitted
+    resid = y - A @ beta
     rss = float(resid @ resid)
     tss = float(((y - y.mean()) ** 2).sum())
     df_resid, df_model = n - p, p - 1
     sigma2 = rss / df_resid
     Rinv = np.linalg.inv(R)
-    xtx_inv = Rinv @ Rinv.T
-    se = np.sqrt(sigma2 * np.diag(xtx_inv))
+    se = np.sqrt(sigma2 * np.diag(Rinv @ Rinv.T))
     t = beta / se
     pv = 2 * stats.t.sf(np.abs(t), df_resid)
     tcrit = stats.t.ppf(0.975, df_resid)
     r2 = 1 - rss / tss
     F = ((tss - rss) / df_model) / sigma2 if df_model > 0 else math.nan
-    llf = -n / 2 * (math.log(2 * math.pi) + math.log(rss / n) + 1)
     coefs = [dict(name="(Intercept)" if j == 0 else names[keep[j - 1]], estimate=float(beta[j]), se=float(se[j]),
                   t=float(t[j]), p=float(pv[j]), lower=float(beta[j] - tcrit * se[j]), upper=float(beta[j] + tcrit * se[j]))
              for j in range(p)]
     return dict(feature_index=keep, features=[names[j] for j in keep], dropped_collinear=dropped, coefficients=coefs,
-                beta=beta, n=n, p=p, df_resid=df_resid, df_model=df_model, rss=rss, tss=tss, r2=r2,
-                adj_r2=1 - (1 - r2) * (n - 1) / df_resid, sigma=math.sqrt(sigma2), F=F,
-                F_p=float(stats.f.sf(F, df_model, df_resid)) if df_model > 0 else math.nan,
-                aic=-2 * llf + 2 * p, bic=-2 * llf + math.log(n) * p)
+                beta=beta, n=n, p=p, r2=r2, adj_r2=1 - (1 - r2) * (n - 1) / df_resid, sigma=math.sqrt(sigma2), F=F,
+                F_p=float(stats.f.sf(F, df_model, df_resid)) if df_model > 0 else math.nan)
 
 
 def predict(model: dict, X: np.ndarray) -> np.ndarray:
@@ -214,166 +211,113 @@ def vif(X: np.ndarray, names: list[str], cols: list[int]) -> list[float]:
     return out
 
 
-def standardized(model: dict, X: np.ndarray, y: np.ndarray) -> list[float]:
-    sd_y = y.std(ddof=1)
-    return [float(model["beta"][k + 1] * X[:, j].std(ddof=1) / sd_y) for k, j in enumerate(model["feature_index"])]
+# ------------------------------------------------ 特徵選擇：5 種方法 × k
+
+def rankings(Xtr: pd.DataFrame, ytr: pd.Series, kf: KFold) -> tuple[dict, dict, dict]:
+    """回傳 (各方法的特徵排序, LassoCV 資訊, 單變數統計)。排序的前 k 個 = 該方法選 k 個特徵的結果。"""
+    cols, K = list(Xtr.columns), Xtr.shape[1]
+    scaler = StandardScaler().fit(Xtr)
+    Z = pd.DataFrame(scaler.transform(Xtr), columns=cols, index=Xtr.index)
+
+    F, Fp = f_regression(Xtr, ytr)
+    r = Xtr.corrwith(ytr)
+    rfe = RFE(LinearRegression(), n_features_to_select=1).fit(Z, ytr)
+    # tol 調小讓座標下降收斂到精確解（預設 tol=1e-4 時相鄰 α 的 CV 誤差幾乎同分，可能選到隔壁的 α）
+    lcv = LassoCV(cv=kf, tol=1e-10, max_iter=100_000).fit(Z, ytr)
+
+    order: list[str] = []
+    for k in range(1, K):
+        sfs = SequentialFeatureSelector(LinearRegression(), n_features_to_select=k, direction="forward", cv=kf)
+        chosen = Xtr.columns[sfs.fit(Xtr, ytr).get_support()]
+        order += [c for c in chosen if c not in order]
+    order += [c for c in cols if c not in order]
+
+    rank = {
+        "pearson": list(r.abs().fillna(0).sort_values(ascending=False, kind="stable").index),
+        "kbest": [cols[i] for i in np.argsort(np.nan_to_num(F), kind="mergesort")[::-1]],
+        "rfe": [cols[i] for i in np.argsort(rfe.ranking_, kind="stable")],
+        "sfs": order,
+        "lasso": [cols[i] for i in np.argsort(np.abs(lcv.coef_), kind="stable")[::-1]],
+    }
+    lasso = dict(model=lcv, scaler=scaler, alpha=float(lcv.alpha_),
+                 features=[c for c, b in zip(cols, lcv.coef_) if b != 0], coef_std=lcv.coef_.tolist(),
+                 coef_raw=(lcv.coef_ / scaler.scale_).tolist(),
+                 intercept_raw=float(lcv.intercept_ - (lcv.coef_ / scaler.scale_) @ scaler.mean_))
+    uni = dict(r=r.to_dict(), F=dict(zip(cols, F.tolist())), F_p=dict(zip(cols, Fp.tolist())))
+    return rank, lasso, uni
 
 
-def backward_elimination(X, y, names, sl, cols):
-    active, steps = list(cols), []
-    while True:
-        m = fit_ols(X, y, names, active)
-        pv = [c["p"] for c in m["coefficients"][1:]]
-        if not pv or not max(pv) > sl:
-            return m, steps
-        worst = int(np.argmax(pv))
-        steps.append(dict(removed=m["coefficients"][worst + 1]["name"], p=pv[worst], r2=m["r2"],
-                          adj_r2=m["adj_r2"], n_features=len(active)))
-        active = [j for k, j in enumerate(m["feature_index"]) if k != worst]
+def feature_selection(Xtr, ytr, Xte, yte, names, seed):
+    Xtr_df, Xte_df = pd.DataFrame(Xtr, columns=names), pd.DataFrame(Xte, columns=names)
+    ytr_s = pd.Series(ytr)
+    kf = KFold(n_splits=5, shuffle=True, random_state=seed)
+    rank, lasso, uni = rankings(Xtr_df, ytr_s, kf)
+    K = len(names)
+    cache: dict[tuple, dict] = {}
 
+    def evaluate(feats):
+        key = tuple(sorted(names.index(f) for f in feats))
+        if key not in cache:
+            m = fit_ols(Xtr, ytr, names, list(key))
+            cv = cross_val_score(LinearRegression(), Xtr_df[list(feats)], ytr_s, cv=kf, scoring="neg_root_mean_squared_error")
+            cache[key] = dict(cols=list(key), model=m, train=metrics(ytr, predict(m, Xtr), len(key)),
+                              test=metrics(yte, predict(m, Xte), len(key)), cv_rmse=float(-cv.mean()))
+        return cache[key]
 
-# ------------------------------------------------- 特徵選擇：依特徵數 k 比較
+    methods = []
+    for key, label, family, rule in METHODS:
+        results = {}
+        for k in range(1, K + 1):
+            res = evaluate(rank[key][:k])
+            results[k] = {**res, "order": rank[key][:k], "added": rank[key][k - 1]}
+        methods.append(dict(key=key, label=label, family=family, rule=rule, ranking=rank[key], results=results))
 
-SELECTION_METHODS = [
-    ("backward_p", "逆向淘汰（p 值）"),
-    ("forward", "前向選擇 Forward"),
-    ("rfe", "RFE（|標準化係數|）"),
-    ("best", "最佳子集 Exhaustive"),
-    ("lasso", "Lasso（L1 排序）"),
-    ("enet", "ElasticNet（α = 0.5）"),
-]
-
-
-def standardized_gram(X, y, cols):
-    """A = ZᵀZ、c = Zᵀ(y − ȳ)，Z 為標準化特徵；任一子集的 RSS 只需解 k×k 系統。"""
-    Z = X[:, cols]
-    Z = (Z - Z.mean(axis=0)) / Z.std(axis=0, ddof=1)
-    yc = y - y.mean()
-    return dict(A=Z.T @ Z, c=Z.T @ yc, syy=float(yc @ yc), n=len(y), K=len(cols))
-
-
-def subset_solve(g, S):
-    if not S:
-        return g["syy"], np.array([])
-    try:
-        L = np.linalg.cholesky(g["A"][np.ix_(S, S)])
-    except np.linalg.LinAlgError:
-        return math.inf, None
-    z = solve_triangular(L, g["c"][S], lower=True)
-    b = solve_triangular(L.T, z, lower=False)
-    return g["syy"] - float(z @ z), b
-
-
-def forward_path(g):
-    chosen, left, subsets = [], list(range(g["K"])), {}
-    while left:
-        best, best_rss = -1, math.inf
-        for a in left:
-            rss, _ = subset_solve(g, chosen + [a])
-            if best == -1 or rss < best_rss:
-                best, best_rss = a, rss
-        chosen.append(best)
-        left.remove(best)
-        subsets[len(chosen)] = list(chosen)
-    return subsets
-
-
-def rfe_path(g):
-    S = list(range(g["K"]))
-    subsets = {len(S): list(S)}
-    while len(S) > 1:
-        _, b = subset_solve(g, S)
-        worst = int(np.argmin(np.abs(b)))
-        S = [a for i, a in enumerate(S) if i != worst]
-        subsets[len(S)] = list(S)
-    return subsets
-
-
-def pvalue_path(X, y, names, cols):
-    active = list(cols)
-    subsets = {len(active): [cols.index(j) for j in active]}
-    while len(active) > 1:
-        m = fit_ols(X, y, names, active)
-        worst = int(np.argmax([c["p"] for c in m["coefficients"][1:]]))
-        active = [j for k, j in enumerate(m["feature_index"]) if k != worst]
-        subsets[len(active)] = [cols.index(j) for j in active]
-    return subsets
-
-
-def best_subset_path(g, max_k=15):
-    K = g["K"]
-    if K > max_k:
-        return None
-    best = {}
-    for mask in range(1, 1 << K):
-        S = [a for a in range(K) if mask >> a & 1]
-        rss, _ = subset_solve(g, S)
-        if len(S) not in best or rss < best[len(S)][0]:
-            best[len(S)] = (rss, S)
-    return {k: v[1] for k, v in best.items()}
-
-
-def enet_path(g, l1_ratio, n_lambda=100, eps=1e-4):
-    """座標下降走 λ 路徑，依特徵第一次進入模型的順序排序（Lasso: l1_ratio = 1）。"""
-    K, n = g["K"], g["n"]
-    A = g["A"].tolist()
-    sd_y = math.sqrt(g["syy"] / (n - 1))
-    c = [v / sd_y for v in g["c"]]
-    lam_max = max(abs(v) / (n * l1_ratio) for v in c)
-    coef, enter = [0.0] * K, [math.inf] * K
-    for s in range(n_lambda):
-        lam = lam_max * eps ** (s / (n_lambda - 1))
-        for _ in range(2000):
-            max_delta = 0.0
-            for j in range(K):
-                r = c[j]
-                for l_ in range(K):
-                    if l_ != j:
-                        r -= A[j][l_] * coef[l_]
-                z = r / n
-                nb = math.copysign(max(abs(z) - lam * l1_ratio, 0.0), z) / (A[j][j] / n + lam * (1 - l1_ratio))
-                max_delta = max(max_delta, abs(nb - coef[j]))
-                coef[j] = nb
-            if max_delta < 1e-10:
-                break
-        for j in range(K):
-            if enter[j] == math.inf and abs(coef[j]) > 1e-12:
-                enter[j] = s
-    order = sorted(range(K), key=lambda a: (enter[a], -abs(coef[a]), a))
-    return {k: order[:k] for k in range(1, K + 1)}
-
-
-def feature_selection(Xtr, ytr, Xte, yte, names, cols):
-    g = standardized_gram(Xtr, ytr, cols)
-    subsets_by = dict(backward_p=pvalue_path(Xtr, ytr, names, cols), forward=forward_path(g), rfe=rfe_path(g),
-                      best=best_subset_path(g), lasso=enet_path(g, 1.0), enet=enet_path(g, 0.5))
-    cache = {}
-
-    def evaluate(S):
-        sub = sorted(cols[a] for a in S)
-        if tuple(sub) not in cache:
-            m = fit_ols(Xtr, ytr, names, sub)
-            cache[tuple(sub)] = dict(cols=sub, features=m["features"], k=len(sub),
-                                     train=metrics(ytr, predict(m, Xtr), m["p"] - 1),
-                                     test=metrics(yte, predict(m, Xte), m["p"] - 1))
-        return cache[tuple(sub)]
-
-    methods = [dict(key=key, label=label, results={k: evaluate(subsets_by[key][k]) for k in range(1, len(cols) + 1)})
-               for key, label in SELECTION_METHODS if subsets_by[key] is not None]
     best = None
     for m in methods:
-        for k in range(1, len(cols) + 1):
-            res = m["results"][k]
-            score = res["test"]["rmse"]
-            if best is None or score < best["score"] or (score == best["score"] and k < best["k"]):
-                best = {**res, "score": score, "method": m["key"], "label": m["label"]}
-    best["same_methods"] = [m["label"] for m in methods if m["results"][best["k"]]["cols"] == best["cols"]]
-    return dict(K=len(cols), methods=methods, best=best)
+        for k in range(1, K + 1):
+            s = m["results"][k]["test"]["rmse"]
+            if best is None or s < best["score"] * (1 - 1e-12) or (abs(s - best["score"]) <= 1e-12 * best["score"] and k < best["k"]):
+                best = dict(score=s, k=k, method=m["key"], res=m["results"][k])
+    best["same_methods"] = [m["label"] for m in methods if m["results"][best["k"]]["cols"] == best["res"]["cols"]]
+
+    p = lasso["model"].predict(pd.DataFrame(lasso["scaler"].transform(Xte_df), columns=names))
+    ptr = lasso["model"].predict(pd.DataFrame(lasso["scaler"].transform(Xtr_df), columns=names))
+    lasso.update(k=len(lasso["features"]), test=metrics(yte, p, len(lasso["features"])),
+                 train=metrics(ytr, ptr, len(lasso["features"])))
+    return dict(K=K, methods=methods, best=best, lasso=lasso, uni=uni)
 
 
 # -------------------------------------------------------------------- 圖表
 
-COLORS = dict(train="#3b5bdb", test="#e8590c", pos="#0c8599", neg="#d6336c", muted="#868e96")
+def plot_trajectory(sel: dict, path: Path, basis: str = "test"):
+    """1×2 雙軌跡折線圖：RMSE / R² vs 特徵數 k（5 種顏色 + 專屬線型與標記 + 水平微偏移 + LassoCV ★）。"""
+    K, ks = sel["K"], np.arange(1, sel["K"] + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    b, lcv = sel["best"], sel["lasso"]
+    for ax, metric, title in [(axes[0], "rmse", "RMSE"), (axes[1], "r2", "R-squared")]:
+        for i, m in enumerate(sel["methods"]):
+            st = STYLE[m["key"]]
+            vals = [m["results"][k][basis][metric] for k in ks]
+            ax.plot(ks + (i - 2) * JITTER, vals, ls=st["ls"], marker=st["marker"], fillstyle=st["fill"], color=st["color"],
+                    lw=2, ms=8, markerfacecolor="white" if st["fill"] == "none" else st["color"],
+                    label=f"{i + 1}. {m['label']} ({m['family']})")
+        ax.scatter([lcv["k"]], [lcv[basis][metric]], marker="*", s=320, color="#f2b01e", edgecolor="black", zorder=6,
+                   label=f"LassoCV native shrinkage (k={lcv['k']})")
+        bi = [m["key"] for m in sel["methods"]].index(b["method"])
+        ax.scatter([b["k"] + (bi - 2) * JITTER], [b["res"][basis][metric]], s=420, facecolor="none", edgecolor="#f2b01e",
+                   lw=2, zorder=5, label=f"Best: lowest test RMSE (k={b['k']})")
+        ax.set_xticks(ks)
+        ax.set_xlim(0.5, K + 0.5)
+        ax.set_title(f"{title} by Number of Features", fontweight="bold")
+        ax.set_xlabel("Number of Features (k)")
+        ax.set_ylabel(f"Test {title}" if basis == "test" else title)
+        ax.grid(alpha=0.3)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=9.5, frameon=False, markerscale=0.8)
+    fig.suptitle("Comparison of 5 Feature Selection Schemes (k = 1 to %d)" % K, fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=(0, 0.11, 1, 1))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
 def plot_corr(corr: pd.DataFrame, path: Path):
@@ -395,17 +339,16 @@ def plot_corr(corr: pd.DataFrame, path: Path):
     plt.close(fig)
 
 
-def plot_actual_vs_pred(ytr, ptr, yte, pte, target, path: Path):
+def plot_actual_vs_pred(ytr, ptr, yte, pte, target, title, path: Path):
     fig, ax = plt.subplots(figsize=(5.6, 5))
-    ax.scatter(ytr, ptr, s=22, alpha=0.7, color=COLORS["train"], label="Train")
-    if len(yte):
-        ax.scatter(yte, pte, s=30, alpha=0.9, color=COLORS["test"], label="Test", marker="D")
+    ax.scatter(ytr, ptr, s=22, alpha=0.6, color="#8a93a8", label=f"Train ({len(ytr)})")
+    ax.scatter(yte, pte, s=36, alpha=0.95, color="#4f46e5", label=f"Test ({len(yte)})")
     allv = np.concatenate([ytr, ptr, yte, pte])
     lo, hi = allv.min(), allv.max()
-    ax.plot([lo, hi], [lo, hi], ls="--", color=COLORS["muted"], lw=1, label="y = x")
+    ax.plot([lo, hi], [lo, hi], ls="--", color="#868e96", lw=1, label="y = x")
     ax.set_xlabel(f"Actual {target}")
     ax.set_ylabel(f"Predicted {target}")
-    ax.set_title("Actual vs Predicted (full model)")
+    ax.set_title(title)
     ax.legend()
     ax.grid(alpha=0.25)
     fig.tight_layout()
@@ -413,56 +356,16 @@ def plot_actual_vs_pred(ytr, ptr, yte, pte, target, path: Path):
     plt.close(fig)
 
 
-def plot_residuals(ptr, rtr, pte, rte, path: Path):
+def plot_residuals(ptr, rtr, pte, rte, title, path: Path):
     fig, ax = plt.subplots(figsize=(5.6, 4.2))
-    ax.scatter(ptr, rtr, s=22, alpha=0.7, color=COLORS["train"], label="Train")
-    if len(pte):
-        ax.scatter(pte, rte, s=30, alpha=0.9, color=COLORS["test"], label="Test", marker="D")
-    ax.axhline(0, ls="--", color=COLORS["muted"], lw=1)
+    ax.scatter(ptr, rtr, s=22, alpha=0.6, color="#8a93a8", label="Train")
+    ax.scatter(pte, rte, s=36, alpha=0.95, color="#4f46e5", label="Test")
+    ax.axhline(0, ls="--", color="#868e96", lw=1)
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Residual (actual - predicted)")
-    ax.set_title("Residuals vs Predicted (full model)")
+    ax.set_title(title)
     ax.legend()
     ax.grid(alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-
-
-def plot_std_coef(names, values, pvals, sl, path: Path):
-    order = np.argsort(np.abs(values))
-    fig, ax = plt.subplots(figsize=(6, max(2.6, 0.38 * len(names) + 1.2)))
-    for rank, i in enumerate(order):
-        color = COLORS["pos"] if values[i] >= 0 else COLORS["neg"]
-        ax.barh(rank, values[i], color=color, alpha=1.0 if pvals[i] < sl else 0.35)
-    ax.set_yticks(range(len(names)), [names[i] for i in order])
-    ax.axvline(0, color=COLORS["muted"], lw=1)
-    ax.set_xlabel("Standardized coefficient (faded = not significant)")
-    ax.set_title("Feature influence (full model)")
-    ax.grid(axis="x", alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-
-
-LINE_COLORS = ["#3b5bdb", "#e8590c", "#0c8599", "#d6336c", "#5c940d", "#7048e8"]
-LINE_MARKERS = ["o", "s", "^", "D", "x", "*"]
-
-
-def plot_selection(sel: dict, path: Path):
-    ks = list(range(1, sel["K"] + 1))
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
-    for i, m in enumerate(sel["methods"]):
-        ax.plot(ks, [m["results"][k]["test"]["rmse"] for k in ks], marker=LINE_MARKERS[i % 6], ms=5, lw=1.6,
-                color=LINE_COLORS[i % 6], alpha=0.85, label=m["key"])
-    b = sel["best"]
-    ax.scatter([b["k"]], [b["test"]["rmse"]], marker="*", s=260, color="black", zorder=5, label=f"best k={b['k']}")
-    ax.set_xticks(ks)
-    ax.set_xlabel("Number of features k")
-    ax.set_ylabel("Test RMSE")
-    ax.set_title("Feature selection: test RMSE vs k")
-    ax.grid(alpha=0.25)
-    ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -511,23 +414,21 @@ def equation(model: dict, target: str) -> str:
     return f"{target} = " + " ".join(parts)
 
 
-def coef_table(model: dict, sl: float, vifs=None, stdc=None) -> str:
-    header = ["變數", "係數", "標準誤", "t", "p 值", "95% 信賴區間"]
-    if vifs is not None:
-        header += ["VIF", "標準化係數"]
+def coef_table(model: dict, vifs=None) -> str:
+    header = ["變數", "係數", "標準誤", "t", "p 值", "95% 信賴區間"] + (["VIF"] if vifs is not None else [])
     rows = []
     for k, c in enumerate(model["coefficients"]):
-        name = f"**{c['name']}**" if k > 0 and c["p"] < sl else c["name"]
+        name = f"**{c['name']}**" if k > 0 and c["p"] < 0.05 else c["name"]
         row = [name, fmt(c["estimate"]), fmt(c["se"]), f"{c['t']:.3f}", f"{fmt_p(c['p'])} {stars(c['p'])}".strip(),
                f"[{fmt(c['lower'])}, {fmt(c['upper'])}]"]
         if vifs is not None:
-            row += (["—", "—"] if k == 0 else [fmt(vifs[k - 1], 4), f"{stdc[k - 1]:.3f}"])
+            row.append("—" if k == 0 else fmt(vifs[k - 1], 4))
         rows.append(row)
     return md_table(header, rows)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CRISP-DM multiple linear regression report")
+    ap = argparse.ArgumentParser(description="CRISP-DM multiple linear regression × 5 feature selection schemes")
     ap.add_argument("--url", required=True, help="CSV 網址或本機路徑")
     ap.add_argument("--target", help="目標欄位（預設：最後一個數值欄位）")
     ap.add_argument("--name", default="Dataset", help="資料集名稱（報告標題）")
@@ -535,8 +436,7 @@ def main():
     ap.add_argument("--business", default="", help="商業理解：要解決的問題（一段文字）")
     ap.add_argument("--exclude", nargs="*", default=[], help="不放入模型的欄位")
     ap.add_argument("--test-ratio", type=float, default=0.2)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--sl", type=float, default=0.05, help="逆向淘汰顯著水準")
+    ap.add_argument("--seed", type=int, default=42, help="train_test_split 與 KFold 的 random_state")
     ap.add_argument("--sep", default=",", help="分隔符號（預設逗號）")
     ap.add_argument("--out-root", default="reports")
     ap.add_argument("--site", default="", help="互動式網頁網址（寫進報告的部署段落）")
@@ -545,6 +445,8 @@ def main():
     out = Path(args.out_root) / args.slug
     figs = out / "figures"
     figs.mkdir(parents=True, exist_ok=True)
+    for old in figs.glob("*.png"):
+        old.unlink()
 
     # 2. Data Understanding
     df = load_table(args.url, args.sep)
@@ -556,53 +458,49 @@ def main():
     features = [c["name"] for c in cols if c["name"] != target and not c["exclude"]
                 and c["type"] != "empty" and c["name"] not in args.exclude]
 
-    # 3. Data Preparation
+    # 3. Data Preparation：One-hot、train_test_split（與網頁相同）
     d = build_design(df, cols, target, features)
     X, y, names = d["X"], d["y"], d["names"]
-    train_idx, test_idx = train_test_split_idx(len(y), args.test_ratio, args.seed)
-    if len(test_idx) < 2:
-        raise SystemExit("測試集少於 2 筆，請提高 --test-ratio")
+    train_idx, test_idx = train_test_split(np.arange(len(y)), test_size=args.test_ratio, random_state=args.seed)
     Xtr, ytr, Xte, yte = X[train_idx], y[train_idx], X[test_idx], y[test_idx]
 
-    # 4. Modeling
+    # 4. Modeling：全特徵 OLS + 5 種特徵選擇方法
     full = fit_ols(Xtr, ytr, names)
-    reduced, steps = backward_elimination(Xtr, ytr, names, args.sl, full["feature_index"])
-    vifs = vif(Xtr, names, full["feature_index"])
-    std_full = standardized(full, Xtr, ytr)
-    sel = feature_selection(Xtr, ytr, Xte, yte, names, full["feature_index"])
-    sweet = fit_ols(Xtr, ytr, names, sel["best"]["cols"])
-
-    # 與 scikit-learn 交叉驗證係數
-    sk = LinearRegression().fit(Xtr[:, full["feature_index"]], ytr)
+    if full["dropped_collinear"]:
+        keep = full["feature_index"]
+        X, Xtr, Xte, names = X[:, keep], Xtr[:, keep], Xte[:, keep], [names[j] for j in keep]
+        full = fit_ols(Xtr, ytr, names)
+    sk = LinearRegression().fit(Xtr, ytr)
     assert np.allclose(sk.coef_, full["beta"][1:], rtol=1e-6, atol=1e-8), "OLS 係數與 scikit-learn 不一致"
-    assert math.isclose(sk.intercept_, full["beta"][0], rel_tol=1e-6, abs_tol=1e-8)
+    vifs = vif(Xtr, names, full["feature_index"])
+    sel = feature_selection(Xtr, ytr, Xte, yte, names, args.seed)
+    b, K = sel["best"], sel["K"]
+    bm = b["res"]["model"]
+    full_res = sel["methods"][0]["results"][K]
 
-    # 5. Evaluation
-    def evaluate(m):
-        return dict(train=metrics(ytr, predict(m, Xtr), m["p"] - 1),
-                    test=metrics(yte, predict(m, Xte), m["p"] - 1) if len(yte) > 1 else None)
-
-    ev = dict(full=evaluate(full), reduced=evaluate(reduced), sweet=evaluate(sweet))
-
+    # 5. Evaluation：圖表
     numeric_used = [f for f in features if next(c for c in cols if c["name"] == f)["type"] == "numeric"] + [target]
     corr = d["rows"][numeric_used].apply(lambda s: s.map(to_num)).corr()
     plot_corr(corr, figs / "correlation.png")
-    ptr, pte = predict(full, Xtr), predict(full, Xte)
-    plot_actual_vs_pred(ytr, ptr, yte, pte, target, figs / "actual_vs_predicted.png")
-    plot_residuals(ptr, ytr - ptr, pte, yte - pte, figs / "residuals.png")
-    plot_std_coef(full["features"], np.array(std_full), np.array([c["p"] for c in full["coefficients"][1:]]),
-                  args.sl, figs / "standardized_coefficients.png")
-    plot_selection(sel, figs / "feature_selection.png")
+    plot_trajectory(sel, figs / "feature_selection_5_schemes.png")
+    ptr, pte = predict(bm, Xtr), predict(bm, Xte)
+    best_title = f"Best model: k = {b['k']} ({', '.join(b['res']['order'])})"
+    if len(best_title) > 60:
+        best_title = f"Best model: k = {b['k']}"
+    plot_actual_vs_pred(ytr, ptr, yte, pte, target, best_title, figs / "actual_vs_predicted.png")
+    plot_residuals(ptr, ytr - ptr, pte, yte - pte, f"Residuals (best model, k = {b['k']})", figs / "residuals.png")
 
     # ------------------------------------------------------------ report.md
+    code = lambda xs: ", ".join(f"`{x}`" for x in xs)  # noqa: E731
     L = []
-    L.append(f"# {args.name}：多元線性回歸分析報告（CRISP-DM）\n")
-    L.append(f"> 由 `mlr-crisp-dm` skill 產生 · 資料來源：<{args.url}> · "
-             f"{datetime.now():%Y-%m-%d %H:%M}\n")
+    L.append(f"# {args.name}：CRISP-DM × 5 種特徵選擇方法報告\n")
+    L.append(f"> 由 `mlr-crisp-dm` skill 產生 · 資料來源：<{args.url}> · {datetime.now():%Y-%m-%d %H:%M}\n")
 
     L.append("## 1. Business Understanding 商業理解\n")
-    L.append((args.business or f"以多元線性回歸預測 **{target}**，並找出影響它的主要因素。") + "\n")
-    L.append(f"- 目標變數 y：`{target}`\n- 候選特徵 X：{', '.join(f'`{f}`' for f in features)}\n")
+    L.append((args.business or f"以多元線性回歸預測 **{target}**，並找出最精簡又準確的特徵組合。") + "\n")
+    L.append(f"- 目標變數 y：`{target}`；候選特徵：{code(features)}")
+    L.append(f"- 比較 5 種特徵選擇方法在 **k = 1 ~ {K}** 的 Test RMSE（越低越好）與 Test R²（越高越好），"
+             "表現相同時選特徵較少的模型。\n")
 
     L.append("## 2. Data Understanding 資料理解\n")
     L.append(f"資料共 **{len(df)} 筆 × {df.shape[1]} 欄**，缺失值 {sum(c['missing'] for c in cols)} 個。\n")
@@ -624,132 +522,112 @@ def main():
         if c["type"] == "categorical" and not c["exclude"]:
             counts = df[c["name"]].value_counts().sort_index()
             L.append(f"**{c['name']} 類別分布**：" + "、".join(f"{k} {v} 筆" for k, v in counts.items()) + "\n")
-    corr_t = corr[target].drop(target).sort_values(key=np.abs, ascending=False)
-    L.append("**與目標的相關係數（依絕對值排序）**：" +
-             "、".join(f"`{k}` {v:+.3f}" for k, v in corr_t.items()) + "\n")
+    uni = sel["uni"]
+    order_r = sorted(names, key=lambda f: -abs(uni["r"][f]) if math.isfinite(uni["r"][f]) else 0)
+    L.append("**訓練集單變數統計（兩種 Filter 方法的依據）**\n")
+    L.append(md_table(["特徵", "Pearson r", "F（f_regression）", "p 值"],
+                      [[f"`{f}`", f"{uni['r'][f]:+.4f}", fmt(uni["F"][f], 5), fmt_p(uni["F_p"][f])] for f in order_r]) + "\n")
+    L.append("F = (n − 2)·r² / (1 − r²) 是 |r| 的單調函數，所以 Pearson 與 SelectKBest 的排序完全相同，兩條線重疊是正確結果。\n")
     L.append("![Correlation](figures/correlation.png)\n")
 
     L.append("## 3. Data Preparation 資料準備\n")
     L.append(f"- 缺失值：{'刪除 ' + str(d['n_dropped']) + ' 筆含缺失值的資料' if d['n_dropped'] else '無缺失值，不需處理'}")
     for e in d["encodings"]:
         if e["type"] == "categorical":
-            L.append(f"- One-hot encoding：`{e['feature']}` → {', '.join(f'`{c}`' for c in e['columns'])}"
-                     f"（基準類別 `{e['baseline']}`，drop first 避免 dummy variable trap）")
+            L.append(f"- One-hot（drop_first）：`{e['feature']}` → {code(e['columns'])}（基準類別 `{e['baseline']}`，"
+                     "避免 dummy variable trap）")
     excluded = [c for c in cols if c["exclude"] and c["name"] != target]
     if excluded:
         L.append("- 排除欄位：" + "、".join(f"`{c['name']}`（{c['exclude']}）" for c in excluded))
     if args.exclude:
         L.append("- 手動排除：" + "、".join(f"`{x}`" for x in args.exclude))
-    L.append(f"- 訓練/測試切分：訓練 {len(ytr)} 筆、測試 {len(yte)} 筆（test ratio {args.test_ratio}、"
-             f"seed {args.seed}，mulberry32 洗牌，與網頁版相同）")
-    L.append("- 模型直接使用原始單位（不標準化），另以標準化係數比較各特徵影響力\n")
+    L.append(f"- 切分：`train_test_split(test_size={args.test_ratio}, random_state={args.seed})` → 訓練 {len(ytr)} 筆、"
+             f"測試 {len(yte)} 筆（網頁以 numpy MT19937 重現同一個排列，逐筆相同）")
+    L.append("- 標準化：`StandardScaler` 只用訓練集 fit，供 RFE 與 Lasso 比較係數大小；選出的特徵一律用 OLS 在原始單位重新配適")
+    L.append(f"- 交叉驗證：`KFold(n_splits=5, shuffle=True, random_state={args.seed})`，供 Forward SFS、LassoCV 與 CV RMSE 共用\n")
 
     L.append("## 4. Modeling 建模\n")
-    L.append("### 4.1 全特徵模型（OLS）\n")
+    L.append("### 4.1 五種特徵選擇方法\n")
+    L.append(md_table(["#", "方法", "類型", "規則", "特徵排序（前 k 個 = 選 k 個特徵）"],
+                      [[str(i + 1), m["label"], m["family"], m["rule"], " › ".join(m["ranking"])]
+                       for i, m in enumerate(sel["methods"])]) + "\n")
+    lc = sel["lasso"]
+    L.append(f"LassoCV 以 5 折 CV 選出 α = {fmt(lc['alpha'], 6)}，保留 {lc['k']} 個非 0 係數：{code(lc['features'])}。\n")
+    L.append("### 4.2 全特徵模型（OLS，訓練集）\n")
     L.append(f"`{equation(full, target)}`\n")
-    L.append(coef_table(full, args.sl, vifs, std_full) + "\n")
-    L.append(f"R² = **{full['r2']:.4f}**、Adj R² = **{full['adj_r2']:.4f}**、F = {fmt(full['F'])}"
-             f"（p = {fmt_p(full['F_p'])}）、殘差標準誤 σ = {fmt(full['sigma'])}、AIC = {fmt(full['aic'])}、"
-             f"BIC = {fmt(full['bic'])}；顯著標記：*** p<0.001、** p<0.01、* p<0.05、. p<0.1\n")
-    if full["dropped_collinear"]:
-        L.append(f"> ⚠️ 完全共線而移除：{', '.join(full['dropped_collinear'])}\n")
-
-    L.append(f"### 4.2 逆向淘汰（Backward Elimination，SL = {args.sl}）\n")
-    if steps:
-        L.append(md_table(["步驟", "移除變數", "p 值", "移除前 R²", "移除前 Adj R²"],
-                          [[str(i + 1), f"`{s['removed']}`", fmt_p(s["p"]), f"{s['r2']:.4f}", f"{s['adj_r2']:.4f}"]
-                           for i, s in enumerate(steps)]) + "\n")
-    else:
-        L.append("所有特徵的 p 值都小於 SL，不需移除任何特徵。\n")
-    L.append(f"保留特徵：{', '.join(f'`{f}`' for f in reduced['features']) or '（只剩截距）'}\n")
-    L.append(f"`{equation(reduced, target)}`\n")
-    L.append(coef_table(reduced, args.sl) + "\n")
+    L.append(coef_table(full, vifs) + "\n")
+    L.append(f"R² = **{full['r2']:.4f}**、Adj R² = **{full['adj_r2']:.4f}**、F = {fmt(full['F'])}（p = {fmt_p(full['F_p'])}）、"
+             f"殘差標準誤 σ = {fmt(full['sigma'])}；粗體 = p < 0.05（*** p<0.001、** p<0.01、* p<0.05、. p<0.1）\n")
 
     L.append("## 5. Evaluation 評估\n")
-    rows = []
-    models = dict(full=full, reduced=reduced, sweet=sweet)
-    for key, label in (("full", "全特徵模型"), ("reduced", f"逆向淘汰模型（SL = {args.sl}）"),
-                       ("sweet", f"最佳 k 模型（k = {sel['best']['k']}）")):
-        tr, te = ev[key]["train"], ev[key]["test"]
-        rows.append([label, str(len(models[key]["features"])), f"{tr['r2']:.4f}",
-                     f"{tr['adj_r2']:.4f}", f"{te['r2']:.4f}", fmt(te["rmse"]), fmt(te["mae"])])
-    L.append(md_table(["模型", "特徵數", "Train R²", "Train Adj R²", "Test R²", "Test RMSE", "Test MAE"], rows) + "\n")
+    L.append("![5 feature selection schemes](figures/feature_selection_5_schemes.png)\n")
+    digits = 2 if abs(full_res["test"]["rmse"]) >= 100 else 4  # 誤差指標的小數位數（與網頁相同）
+    fm = lambda v: f"{v:,.{digits}f}"  # noqa: E731
+    for metric, title, f in (("rmse", "Test RMSE", fm), ("r2", "Test R²", lambda v: f"{v:.4f}")):
+        rows = []
+        for k in range(1, K + 1):
+            cells = [str(k)]
+            for m in sel["methods"]:
+                res = m["results"][k]
+                v = f(res["test"][metric])
+                cells.append(f"**{v}**" if res["cols"] == b["res"]["cols"] else v)
+            rows.append(cells)
+        L.append(f"**{title}**（粗體 = 最佳組合）\n")
+        L.append(md_table(["k"] + [m["label"] for m in sel["methods"]], rows) + "\n")
+    L.append("**每個 k 新增的特徵**（前 k 列累積起來就是選出的 k 個特徵）\n")
+    L.append(md_table(["k"] + [m["label"] for m in sel["methods"]],
+                      [[str(k)] + [f"+{m['results'][k]['added']}" for m in sel["methods"]] for k in range(1, K + 1)]) + "\n")
+    cv_rows = [[str(k)] + [fm(m["results"][k]["cv_rmse"]) for m in sel["methods"]] for k in range(1, K + 1)]
+    L.append("**5-fold CV RMSE（訓練集內）**\n")
+    L.append(md_table(["k"] + [m["label"] for m in sel["methods"]], cv_rows) + "\n")
+    cv_best = min(((m["results"][k]["cv_rmse"], k, m["results"][k]["cols"]) for m in sel["methods"] for k in range(1, K + 1)),
+                  key=lambda t: (t[0], t[1]))
+    cv_methods = "、".join(m["label"] for m in sel["methods"] if m["results"][cv_best[1]]["cols"] == cv_best[2])
+
+    L.append("**結論**\n")
+    L.append(f"- 最佳組合（Test RMSE 最低）：**k = {b['k']}**，{code(b['res']['order'])}，Test RMSE = **{fm(b['res']['test']['rmse'])}**、"
+             f"R² = **{b['res']['test']['r2']:.4f}**（選出這組特徵的方法：{'、'.join(b['same_methods'])}）。")
+    L.append(f"- 全特徵模型（k = {K}）：Test RMSE {fm(full_res['test']['rmse'])}、R² {full_res['test']['r2']:.4f}"
+             + (f" → 最佳組合的 RMSE 降低 {(1 - b['res']['test']['rmse'] / full_res['test']['rmse']) * 100:.1f}%。"
+                if b["k"] < K else "。"))
+    L.append(f"- LassoCV 原生收縮模型（★，k = {lc['k']}）：Test RMSE {fm(lc['test']['rmse'])}、R² {lc['test']['r2']:.4f}。")
+    L.append(f"- 以訓練集 5-fold CV 評估時，RMSE 最低在 k = {cv_best[1]}（{cv_methods}，{fm(cv_best[0])}）；"
+             f"測試集只有 {len(yte)} 筆，選 k 時宜同時參考 CV。")
+    high_vif = [f"`{n}`（{v:.1f}）" for n, v in zip(full["features"], vifs) if v > 10]
+    L.append("- 共線性：" + ("、".join(high_vif) + " 的 VIF > 10，有明顯共線性。" if high_vif else "所有特徵 VIF < 10，共線性不嚴重。") + "\n")
+    L.append(f"**最佳模型（k = {b['k']}）**：`{equation(bm, target)}`\n")
+    L.append(coef_table(bm) + "\n")
     L.append("![Actual vs Predicted](figures/actual_vs_predicted.png)\n")
     L.append("![Residuals](figures/residuals.png)\n")
-    L.append("![Standardized coefficients](figures/standardized_coefficients.png)\n")
-
-    b = sel["best"]
-    L.append("### 5.1 特徵選擇比較（依特徵數 k）\n")
-    L.append("六種方法各自決定「用 k 個特徵時選哪些」，每個組合都在訓練集用 OLS 配適、在測試集評估：\n")
-    header = ["k"] + [m["label"] for m in sel["methods"]]
-    trows = []
-    for k in range(1, sel["K"] + 1):
-        cells = [str(k)]
-        for m in sel["methods"]:
-            res = m["results"][k]
-            v = fmt(res["test"]["rmse"])
-            cells.append(f"**{v}**" if res["cols"] == b["cols"] else v)
-        trows.append(cells)
-    L.append("**Test RMSE**（粗體 = 最佳組合）\n")
-    L.append(md_table(header, trows) + "\n")
-    ref = next((m for m in sel["methods"] if m["key"] == "best"), sel["methods"][0])
-    L.append(f"**{ref['label']} 每個 k 選出的特徵**\n")
-    L.append(md_table(["k", "特徵", "Train Adj R²", "Test R²", "Test RMSE"],
-                      [[str(k), ", ".join(f"`{f}`" for f in res["features"]), f"{res['train']['adj_r2']:.4f}",
-                        f"{res['test']['r2']:.4f}", fmt(res["test"]["rmse"])]
-                       for k, res in sorted(ref["results"].items())]) + "\n")
-    L.append(f"最佳組合（測試 RMSE 最低）：**k = {b['k']}**，特徵 {', '.join(f'`{f}`' for f in b['features'])}，"
-             f"Test RMSE = {fmt(b['test']['rmse'])}、Test R² = {b['test']['r2']:.4f}"
-             f"（選出此組合的方法：{'、'.join(b['same_methods'])}）。\n")
-    L.append(f"`{equation(sweet, target)}`\n")
-    L.append("![Feature selection](figures/feature_selection.png)\n")
-    L.append("> 註：依作業範例以測試集比較 k；實務上建議用交叉驗證（cross-validation）選 k，避免對測試集過度調整。\n")
-
-    sig = [c["name"] for c in full["coefficients"][1:] if c["p"] < args.sl]
-    top = sorted(zip(full["features"], std_full), key=lambda t: -abs(t[1]))[:3]
-    high_vif = [f"`{n}`（{v:.1f}）" for n, v in zip(full["features"], vifs) if v > 10]
-    best = "reduced" if ev["reduced"]["test"]["rmse"] < ev["full"]["test"]["rmse"] else "full"
-    L.append("**結論**\n")
-    L.append(f"- 全特徵模型解釋了訓練資料 {full['r2'] * 100:.1f}% 的變異；測試集 R² = {ev['full']['test']['r2']:.4f}、"
-             f"RMSE = {fmt(ev['full']['test']['rmse'])}。")
-    L.append(f"- 在 α = {args.sl} 下顯著的特徵：{', '.join(f'`{s}`' for s in sig) or '無'}。")
-    L.append("- 影響力最大（|標準化係數|）的特徵：" +
-             "、".join(f"`{n}`（{'正' if v > 0 else '負'}向，{v:+.3f}）" for n, v in top) + "。")
-    L.append(f"- 逆向淘汰後保留 {len(reduced['features'])} 個特徵，測試集 R² 從 {ev['full']['test']['r2']:.4f} "
-             f"變為 {ev['reduced']['test']['r2']:.4f}；以測試集 RMSE 來看"
-             f"{'逆向淘汰模型' if best == 'reduced' else '全特徵模型'}較佳。")
-    L.append(f"- 特徵選擇比較：k = {b['k']} 時測試 RMSE 最低（{fmt(b['test']['rmse'])}，R² = {b['test']['r2']:.4f}），"
-             f"特徵為 {', '.join(f'`{f}`' for f in b['features'])}"
-             + (f"，比全特徵模型更精簡（{len(full['features'])} → {b['k']} 個特徵）。" if b["k"] < len(full["features"]) else "。"))
-    L.append("- 共線性：" + ("、".join(high_vif) + " 的 VIF > 10，有明顯共線性。" if high_vif else "所有特徵 VIF < 10，共線性不嚴重。") + "\n")
 
     L.append("## 6. Deployment 部署\n")
     site = f"[互動式網頁（GitHub Pages）]({args.site})" if args.site else "互動式網頁（GitHub Pages）"
-    L.append(f"- {site}：下拉選單切換 Problem、可輸入任意 CSV 網址；同樣的切分與參數會得到與本報告相同的數字。")
-    L.append(f"- 最佳 k 模型（k = {b['k']}）：`{equation(sweet, target)}`")
-    L.append(f"- 逆向淘汰模型（SL = {args.sl}）：`{equation(reduced, target)}`\n")
+    L.append(f"- {site}：下拉選單切換 Problem、可輸入任意 CSV 網址；同樣的切分與參數會得到與本報告相同的數字，"
+             "並可在「模型檢視」用滑桿即時預測。")
+    L.append(f"- 最佳模型：`{equation(bm, target)}`\n")
     (out / "report.md").write_text("\n".join(L), encoding="utf-8")
 
-    def model_json(m):
-        return {k: v for k, v in m.items() if k not in ("beta",)}
+    def res_json(res):
+        return dict(features=res["order"], added=res["added"], train_r2=res["train"]["r2"], test_rmse=res["test"]["rmse"],
+                    test_r2=res["test"]["r2"], test_mae=res["test"]["mae"], cv_rmse=res["cv_rmse"])
 
     (out / "results.json").write_text(json.dumps(dict(
         name=args.name, url=args.url, target=target, features=features, names=names,
-        config=dict(test_ratio=args.test_ratio, seed=args.seed, sl=args.sl),
-        n_rows=len(df), n_used=len(y), n_dropped=d["n_dropped"], train_idx=train_idx, test_idx=test_idx,
-        full=model_json(full), reduced=model_json(reduced), sweet=model_json(sweet), steps=steps, vif=vifs,
-        std_coef=std_full, evaluation=ev,
-        selection=dict(K=sel["K"], best=sel["best"],
-                       methods={m["key"]: {str(k): dict(features=res["features"], test_rmse=res["test"]["rmse"],
-                                                        test_r2=res["test"]["r2"])
-                                           for k, res in sorted(m["results"].items())} for m in sel["methods"]})),
-        ensure_ascii=False, indent=2, default=float), encoding="utf-8")
+        config=dict(test_ratio=args.test_ratio, seed=args.seed, cv="KFold(n_splits=5, shuffle=True, random_state=seed)"),
+        n_rows=len(df), n_used=len(y), n_dropped=d["n_dropped"], train_idx=train_idx.tolist(), test_idx=test_idx.tolist(),
+        full={k: v for k, v in full.items() if k != "beta"}, vif=vifs,
+        selection=dict(K=K, best=dict(k=b["k"], method=b["method"], same_methods=b["same_methods"], **res_json(b["res"])),
+                       methods={m["key"]: dict(label=m["label"], family=m["family"], ranking=m["ranking"],
+                                               results={str(k): res_json(r) for k, r in m["results"].items()})
+                                for m in sel["methods"]},
+                       lasso_cv={k: lc[k] for k in ("alpha", "k", "features", "coef_raw", "intercept_raw", "train", "test")}),
+    ), ensure_ascii=False, indent=2, default=float), encoding="utf-8")
 
-    print(f"[mlr-crisp-dm] {args.name}: n={len(y)} (train {len(ytr)} / test {len(yte)})")
-    print(f"  full    : {len(full['features'])} features, test R2={ev['full']['test']['r2']:.4f}, "
-          f"RMSE={ev['full']['test']['rmse']:.4f}")
-    print(f"  reduced : {reduced['features']}, test R2={ev['reduced']['test']['r2']:.4f}, "
-          f"RMSE={ev['reduced']['test']['rmse']:.4f}")
+    print(f"[mlr-crisp-dm] {args.name}: n={len(y)} (train {len(ytr)} / test {len(yte)}), K={K}")
+    for m in sel["methods"]:
+        print(f"  {m['label']:<20}" + "  ".join(f"{m['results'][k]['test']['rmse']:.4f}" for k in range(1, K + 1)))
+    print(f"  best    : k={b['k']} {b['res']['order']} RMSE={b['res']['test']['rmse']:.4f} R2={b['res']['test']['r2']:.4f}")
+    print(f"  LassoCV : alpha={lc['alpha']:.6g} k={lc['k']} RMSE={lc['test']['rmse']:.4f} R2={lc['test']['r2']:.4f}")
     print(f"  report  : {out / 'report.md'}")
 
 
