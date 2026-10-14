@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>多元線性回歸 · 50 Startups & Boston Housing</title>
+  <meta name="description" content="AIoT DIC2：以 CRISP-DM 流程完成多元線性回歸。下拉切換 50 Startups / Boston Housing，或輸入任意 CSV 資料集網址。">
+  <link rel="stylesheet" href="assets/css/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js" defer></script>
+  <script src="assets/js/mlr.js" defer></script>
+  <script src="assets/js/app.js" defer></script>
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <p class="eyebrow">AIoT · DIC2 · CRISP-DM</p>
+      <h1>多元線性回歸 Multiple Linear Regression</h1>
+      <p class="lead">選擇題目或貼上任意 CSV 網址，網頁會在瀏覽器內完成資料理解、One-hot 編碼、訓練/測試切分、OLS 係數檢定、逆向淘汰與模型評估。</p>
+      <nav class="steps" aria-label="CRISP-DM 步驟">
+        <a href="#s1">1 商業理解</a>
+        <a href="#s2">2 資料理解</a>
+        <a href="#s3">3 資料準備</a>
+        <a href="#s4">4 建模</a>
+        <a href="#s5">5 評估</a>
+        <a href="#s6">6 部署</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card controls" aria-label="資料集設定">
+      <div class="field">
+        <label for="problem">題目 Problem</label>
+        <select id="problem"></select>
+      </div>
+      <div class="field">
+        <label for="url">資料集網址 Dataset URL（CSV）</label>
+        <div class="row">
+          <input id="url" type="url" placeholder="https://raw.githubusercontent.com/…/data.csv" spellcheck="false" autocomplete="off">
+          <button id="load" class="btn primary" type="button">載入</button>
+        </div>
+        <p class="hint">可貼 raw.githubusercontent.com、GitHub 檔案頁網址（會自動轉成 raw），或任何允許跨來源讀取的 CSV；也可以<label class="link" for="file">上傳本機 CSV 檔</label>。</p>
+        <input id="file" type="file" accept=".csv,.tsv,.txt,text/csv" hidden>
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+
+      <div id="config" class="config" hidden>
+        <div class="field">
+          <label for="target">目標 y（Target）</label>
+          <select id="target"></select>
+        </div>
+        <div class="field">
+          <label for="testRatio">測試集比例 <output id="testRatioOut">20%</output></label>
+          <input id="testRatio" type="range" min="0.1" max="0.5" step="0.05" value="0.2">
+        </div>
+        <div class="field">
+          <label for="seed">亂數種子 Seed</label>
+          <input id="seed" type="number" value="42" min="0" step="1">
+        </div>
+        <div class="field">
+          <label for="sl">逆向淘汰顯著水準 SL</label>
+          <input id="sl" type="number" value="0.05" min="0.001" max="0.5" step="0.01">
+        </div>
+        <fieldset class="field full">
+          <legend>特徵 X（Features）— 取消勾選即可排除</legend>
+          <div id="features" class="chips"></div>
+        </fieldset>
+      </div>
+    </section>
+
+    <div id="results" hidden>
+      <section class="card" id="s1">
+        <h2><span class="num">1</span>商業理解 <small>Business Understanding</small></h2>
+        <div id="business"></div>
+      </section>
+
+      <section class="card" id="s2">
+        <h2><span class="num">2</span>資料理解 <small>Data Understanding</small></h2>
+        <div id="dataSummary" class="kpis"></div>
+        <h3>欄位</h3>
+        <div id="columnsTable" class="table-wrap"></div>
+        <h3>資料預覽（前 8 筆）</h3>
+        <div id="preview" class="table-wrap"></div>
+        <h3>敘述統計</h3>
+        <div id="describe" class="table-wrap"></div>
+        <div id="categorical"></div>
+        <h3>相關係數熱圖（Pearson）</h3>
+        <div id="corr" class="table-wrap"></div>
+        <p id="corrNote" class="note"></p>
+      </section>
+
+      <section class="card" id="s3">
+        <h2><span class="num">3</span>資料準備 <small>Data Preparation</small></h2>
+        <ul id="prep" class="checklist"></ul>
+      </section>
+
+      <section class="card" id="s4">
+        <h2><span class="num">4</span>建模 <small>Modeling</small></h2>
+        <h3>全特徵模型（OLS）</h3>
+        <p id="eqFull" class="equation"></p>
+        <div id="statsFull" class="kpis compact"></div>
+        <div id="coefFull" class="table-wrap"></div>
+        <p class="note">粗體列 = p 值小於 SL（顯著）；*** p&lt;0.001、** p&lt;0.01、* p&lt;0.05、. p&lt;0.1；VIF &gt; 10 代表共線性明顯。</p>
+        <h3>逆向淘汰 Backward Elimination</h3>
+        <div id="steps"></div>
+        <p id="eqReduced" class="equation"></p>
+        <div id="coefReduced" class="table-wrap"></div>
+      </section>
+
+      <section class="card" id="s5">
+        <h2><span class="num">5</span>評估 <small>Evaluation</small></h2>
+        <div id="metrics" class="table-wrap"></div>
+        <div class="toolbar">
+          <span>圖表與預測使用：</span>
+          <div class="seg" role="radiogroup" aria-label="選擇模型">
+            <label><input type="radio" name="view" value="full" checked>全特徵模型</label>
+            <label><input type="radio" name="view" value="reduced">逆向淘汰模型</label>
+            <label><input type="radio" name="view" value="sweet">最佳 k 模型</label>
+          </div>
+        </div>
+        <div class="grid2">
+          <figure class="chart">
+            <figcaption>實際值 vs 預測值</figcaption>
+            <div class="chart-box"><canvas id="chartAvP"></canvas></div>
+          </figure>
+          <figure class="chart">
+            <figcaption>殘差圖 Residuals</figcaption>
+            <div class="chart-box"><canvas id="chartResid"></canvas></div>
+          </figure>
+          <figure class="chart">
+            <figcaption>特徵影響力（標準化係數）</figcaption>
+            <div class="chart-box"><canvas id="chartCoef"></canvas></div>
+          </figure>
+          <figure class="chart">
+            <figcaption><span>特徵 vs 目標</span><select id="scatterFeature" aria-label="選擇特徵"></select></figcaption>
+            <div class="chart-box"><canvas id="chartScatter"></canvas></div>
+          </figure>
+        </div>
+
+        <h3>測試集殘差診斷（依 |殘差| 排序）</h3>
+        <div id="residTable" class="table-wrap"></div>
+
+        <h3>特徵選擇比較：特徵數 k 與測試誤差</h3>
+        <p class="note">六種方法各自決定「用 k 個特徵時選哪些」，每個組合都在訓練集用 OLS 配適、在測試集評估，找出誤差最低的 k（parsimony sweet spot）。</p>
+        <div id="sweetSpot" class="kpis"></div>
+        <p id="eqSweet" class="equation"></p>
+        <div class="grid2">
+          <figure class="chart">
+            <figcaption>Test RMSE vs 特徵數 k（越低越好）</figcaption>
+            <div class="chart-box"><canvas id="chartKRmse"></canvas></div>
+          </figure>
+          <figure class="chart">
+            <figcaption>Test R² vs 特徵數 k（越高越好）</figcaption>
+            <div class="chart-box"><canvas id="chartKR2"></canvas></div>
+          </figure>
+        </div>
+        <div id="selectionTable" class="table-wrap"></div>
+        <div id="subsetTable" class="table-wrap"></div>
+        <p class="note">註：依作業範例用測試集比較 k；實務上建議用交叉驗證（cross-validation）選 k，避免對測試集過度調整。</p>
+
+        <div id="conclusion" class="callout"></div>
+      </section>
+
+      <section class="card" id="s6">
+        <h2><span class="num">6</span>部署 <small>Deployment</small></h2>
+        <p>輸入特徵值，用目前選擇的模型即時預測：</p>
+        <form id="predictForm" class="predict-grid" onsubmit="return false"></form>
+        <div id="predictOut" class="predict-out" aria-live="polite"></div>
+        <p class="note">本網站是部署在 GitHub Pages 的純前端靜態頁面，所有計算都在你的瀏覽器內完成，資料不會上傳到任何伺服器。分享目前設定：<a id="shareLink" href="#"></a></p>
+      </section>
+    </div>
+  </main>
+
+  <footer class="wrap footer">
+    <p>
+      <a href="https://github.com/jua91352/AIoT-DIC2-MultipleLR">GitHub 原始碼</a> ·
+      <a href="https://github.com/jua91352/AIoT-DIC2-MultipleLR/blob/main/reports/50_startups/report.md">Problem 1 報告</a> ·
+      <a href="https://github.com/jua91352/AIoT-DIC2-MultipleLR/blob/main/reports/boston_housing/report.md">Problem 2 報告（套用 skill 產生）</a>
+    </p>
+    <p>物聯網應用與資料分析 · DIC2 多元線性回歸</p>
+  </footer>
+</body>
+</html>
